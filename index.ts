@@ -2,42 +2,64 @@ import express, { Express, Request, Response } from "express";
 import dotenv from "dotenv";
 import axios, { AxiosResponse } from "axios";
 import qs from "qs";
-
-const SPOTIFY_BASE_URL = "https://api.spotify.com/v1";
+import { RedisClientType, createClient } from "redis";
 
 dotenv.config();
+
+const SPOTIFY_BASE_URL = "https://api.spotify.com/v1";
+const PORT = process.env.PORT || 3000;
+
 const app: Express = express();
 
-const port = process.env.PORT;
+let redisClient: RedisClientType;
+(async () => {
+  redisClient = createClient();
+
+  redisClient.on("error", (err) => console.error(`Redis Error : ${err}`));
+
+  await redisClient.connect();
+})();
 
 app.get("/", async (_req: Request, res: Response) => {
   res.send("Derail");
 });
 
+// https://open.spotify.com/playlist/6lUCjbghGlDPSG6tYak7Op?si=6ce173f7a5284f7e
+
 app.get("/derail", async (req: Request, res: Response) => {
   const { playlistId } = req.query;
   const token = await getAuthorizationToken();
-  const playlistResponse: AxiosResponse<SpotifyApi.PlaylistTrackResponse> = await axios.get(
-    `${SPOTIFY_BASE_URL}/playlists/${playlistId}/tracks`,
-    { headers: { Authorization: `Bearer ${token}` } }
-  );
-  const tracks = playlistResponse.data;
-  const firstTrack = tracks.items[0].track;
-  if (!firstTrack) {
-    return res.send('fuck :(')
-  }
-  const nextTrack = await getNextTrackOffAlbum(firstTrack, token);
-  if (!nextTrack) {
-    return res.send('fuckkkkkkkkk :((((((((')
-  }
-  res.send(`${firstTrack.name} was derailed to ${nextTrack.name}`);
+  const playlistResponse: AxiosResponse<SpotifyApi.PlaylistTrackResponse> =
+    await axios.get(`${SPOTIFY_BASE_URL}/playlists/${playlistId}/tracks`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  const playlistTracks = playlistResponse.data.items;
+  const derailed = await Promise.all(await derail(playlistTracks));
+  // const derailed = await Promise.all(
+  //   playlistTracks.map(async (playlistTrack) => {
+  //     const track = playlistTrack.track;
+  //     return track ? (await getNextTrackOffAlbum(track))?.name : null;
+  //   })
+  // );
+  const names = derailed.map((d, index) => {
+    if (!d) {
+      const oldSong = playlistTracks[index].track?.name;
+      return 'BAD TRACK DERAILING FROM ' + oldSong
+    }
+    return d.name;
+  });
+  res.json(names);
 });
 
-app.listen(port, () => {
-  console.log(`⚡️[server]: Server is running at http://localhost:${port}`);
+app.listen(PORT, () => {
+  console.log(`⚡️[server]: Server is running at http://localhost:${PORT}`);
 });
 
-async function getAuthorizationToken() {
+async function getAuthorizationToken(): Promise<string | null> {
+  const cachedToken = await redisClient.get("token");
+  if (cachedToken) {
+    return cachedToken;
+  }
   const response = await axios.post(
     "https://accounts.spotify.com/api/token",
     qs.stringify({
@@ -51,19 +73,65 @@ async function getAuthorizationToken() {
       },
     }
   );
-  return response.data.access_token;
+  const accessToken = response.data.access_token;
+  await redisClient.set("token", accessToken);
+  return accessToken;
 }
 
-async function getNextTrackOffAlbum(track: SpotifyApi.TrackObjectFull, token: string): Promise<SpotifyApi.TrackObjectSimplified | undefined> {
+// Only fetch each album once
+// Maintain track order
+async function derail(
+  playlistTracks: SpotifyApi.PlaylistTrackObject[]
+): Promise<Promise<SpotifyApi.TrackObjectSimplified | null | undefined>[]> {
+  const token = await getAuthorizationToken();
+  const albumPromises = playlistTracks.reduce((albumLinks, playlistTrack) => {
+    if (!playlistTrack.track || !playlistTrack.track.album) {
+      return albumLinks;
+    }
+    const albumHref = playlistTrack.track.album.href;
+    if (!albumLinks[albumHref]) {
+      albumLinks[albumHref] = axios.get(`${albumHref}/tracks`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    }
+
+    return albumLinks;
+  }, {} as Record<string, Promise<AxiosResponse<SpotifyApi.AlbumTracksResponse>>>);
+
+  return playlistTracks.map(async (playlistTrack, index) => {
+    const { track } = playlistTrack;
+    if (!track || !track.album) {
+      console.log("messed up track at ", index);
+      return null;
+    }
+
+    const albumTracks = (await albumPromises[track.album.href]).data.items;
+    if (track.track_number > albumTracks.length) {
+      return albumTracks[0];
+    }
+
+    return albumTracks.find(
+      (albumTrack) => albumTrack.track_number === track.track_number + 1
+    );
+  });
+}
+
+async function getNextTrackOffAlbum(
+  track: SpotifyApi.TrackObjectFull
+): Promise<SpotifyApi.TrackObjectSimplified | undefined> {
   const albumHref = track.album.href;
   const trackNumber = track.track_number;
-  const albumResponse: AxiosResponse<SpotifyApi.AlbumTracksResponse> = await axios.get(`${albumHref}/tracks`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  const token = await getAuthorizationToken();
+  const albumResponse: AxiosResponse<SpotifyApi.AlbumTracksResponse> =
+    await axios.get(`${albumHref}/tracks`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
   const albumTracks = albumResponse.data.items;
   if (trackNumber > albumTracks.length) {
     return albumTracks[0];
   }
 
-  return albumTracks.find((track: any) => track.track_number === trackNumber + 1)
+  return albumTracks.find(
+    (track: any) => track.track_number === trackNumber + 1
+  );
 }
