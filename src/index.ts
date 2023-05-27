@@ -1,10 +1,13 @@
 import express, { Express, Request, Response } from "express";
 import dotenv from "dotenv";
-import axios, { AxiosResponse } from "axios";
+import axios, { AxiosError, AxiosResponse } from "axios";
 import qs from "qs";
 import { RedisClientType, createClient } from "redis";
+import { HttpClient } from "./helpers/http-client";
 
 dotenv.config();
+
+const apiClient = new HttpClient(getAuthorizationToken);
 
 const SPOTIFY_BASE_URL = "https://api.spotify.com/v1";
 const PORT = process.env.PORT || 3000;
@@ -28,11 +31,14 @@ app.get("/", async (_req: Request, res: Response) => {
 
 app.get("/derail", async (req: Request, res: Response) => {
   const { playlistId } = req.query;
-  const token = await getAuthorizationToken();
+  console.log("about to fetch ", playlistId);
   const playlistResponse: AxiosResponse<SpotifyApi.PlaylistTrackResponse> =
-    await axios.get(`${SPOTIFY_BASE_URL}/playlists/${playlistId}/tracks`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
+    await apiClient
+      .get(`${SPOTIFY_BASE_URL}/playlists/${playlistId}/tracks`)
+      .catch((error) => {
+        console.log(JSON.stringify(error));
+        res.send(500);
+      });
   const playlistTracks = playlistResponse.data.items;
   const derailed = await Promise.all(await derail(playlistTracks));
   // const derailed = await Promise.all(
@@ -44,7 +50,7 @@ app.get("/derail", async (req: Request, res: Response) => {
   const names = derailed.map((d, index) => {
     if (!d) {
       const oldSong = playlistTracks[index].track?.name;
-      return 'BAD TRACK DERAILING FROM ' + oldSong
+      return "BAD TRACK DERAILING FROM " + oldSong;
     }
     return d.name;
   });
@@ -55,9 +61,9 @@ app.listen(PORT, () => {
   console.log(`⚡️[server]: Server is running at http://localhost:${PORT}`);
 });
 
-async function getAuthorizationToken(): Promise<string | null> {
+async function getAuthorizationToken(breakCache?: boolean): Promise<string> {
   const cachedToken = await redisClient.get("token");
-  if (cachedToken) {
+  if (cachedToken && !breakCache) {
     return cachedToken;
   }
   const response = await axios.post(
@@ -75,7 +81,7 @@ async function getAuthorizationToken(): Promise<string | null> {
   );
   const accessToken = response.data.access_token;
   await redisClient.set("token", accessToken);
-  return accessToken;
+  return accessToken || "";
 }
 
 // Only fetch each album once
@@ -83,16 +89,13 @@ async function getAuthorizationToken(): Promise<string | null> {
 async function derail(
   playlistTracks: SpotifyApi.PlaylistTrackObject[]
 ): Promise<Promise<SpotifyApi.TrackObjectSimplified | null | undefined>[]> {
-  const token = await getAuthorizationToken();
   const albumPromises = playlistTracks.reduce((albumLinks, playlistTrack) => {
     if (!playlistTrack.track || !playlistTrack.track.album) {
       return albumLinks;
     }
     const albumHref = playlistTrack.track.album.href;
     if (!albumLinks[albumHref]) {
-      albumLinks[albumHref] = axios.get(`${albumHref}/tracks`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      albumLinks[albumHref] = apiClient.get(`${albumHref}/tracks`);
     }
 
     return albumLinks;
